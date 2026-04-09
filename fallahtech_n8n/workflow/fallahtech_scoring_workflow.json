@@ -1,0 +1,218 @@
+{
+  "name": "FallahTech — RAG Scoring T3",
+  "nodes": [
+
+    {
+      "id": "n1",
+      "name": "Déclencheur Manuel",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [100, 300],
+      "parameters": {},
+      "notes": "Lance le workflow manuellement depuis l'UI n8n. Pour l'automatiser : remplacer par un Schedule Trigger (ex : chaque lundi 08h00)."
+    },
+
+    {
+      "id": "n2",
+      "name": "Vérifier que le serveur RAG tourne",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [320, 300],
+      "parameters": {
+        "method": "GET",
+        "url": "http://localhost:5678/health",
+        "options": {
+          "timeout": 10000,
+          "response": { "response": { "responseFormat": "json" } }
+        }
+      },
+      "notes": "Appelle GET /health sur le serveur Flask local. Si ce nœud échoue, c'est que bridge_api.py n'est pas lancé. Lancer : python bridge/bridge_api.py"
+    },
+
+    {
+      "id": "n3",
+      "name": "Vérifier ChromaDB indexé",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [540, 300],
+      "parameters": {
+        "method": "GET",
+        "url": "http://localhost:5678/status",
+        "options": {
+          "timeout": 15000,
+          "response": { "response": { "responseFormat": "json" } }
+        }
+      },
+      "notes": "Appelle GET /status. Retourne le nombre de chunks indexés dans ChromaDB. Si status='not_ready', lancer d'abord : python src/ingest.py"
+    },
+
+    {
+      "id": "n4",
+      "name": "ChromaDB est-il prêt ?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [760, 300],
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": false, "leftValue": "", "typeValidation": "strict" },
+          "conditions": [
+            {
+              "id": "cond1",
+              "leftValue": "={{ $json.status }}",
+              "rightValue": "ready",
+              "operator": { "type": "string", "operation": "equals" }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "notes": "Branche True → ChromaDB prêt, on lance le scoring. Branche False → arrêt avec message d'erreur."
+    },
+
+    {
+      "id": "n5_error",
+      "name": "Arrêt — ChromaDB non indexé",
+      "type": "n8n-nodes-base.stopAndError",
+      "typeVersion": 1,
+      "position": [980, 460],
+      "parameters": {
+        "errorMessage": "ChromaDB non indexé. Lance d'abord : python src/ingest.py dans ton projet RAG."
+      },
+      "notes": "Stoppe le workflow proprement si ChromaDB est vide."
+    },
+
+    {
+      "id": "n6",
+      "name": "Lancer le Scoring T3 complet",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [980, 300],
+      "parameters": {
+        "method": "POST",
+        "url": "http://localhost:5678/scoring",
+        "sendBody": true,
+        "contentType": "json",
+        "body": "={}",
+        "options": {
+          "timeout": 600000,
+          "response": { "response": { "responseFormat": "json" } }
+        }
+      },
+      "notes": "Appelle POST /scoring — lance les 4 critères (Financier 40%, Commercial 30%, Équipe 15%, Marché 15%) via le pipeline RAG Python. Timeout 600s car le LLM Qwen est lent en CPU."
+    },
+
+    {
+      "id": "n7",
+      "name": "Construire le Rapport HTML",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1200, 300],
+      "parameters": {
+        "jsCode": "// Construction du rapport HTML à partir de la réponse de /scoring\nconst data = $input.item.json;\n\nconst score      = data.score_total;\nconst reco       = data.recommandation;\nconst criteres   = data.criteres || [];\nconst timestamp  = data.timestamp || new Date().toISOString();\nconst date       = new Date(timestamp).toLocaleDateString('fr-FR', {\n  year: 'numeric', month: 'long', day: 'numeric',\n  hour: '2-digit', minute: '2-digit'\n});\n\n// Couleur selon recommandation\nconst recoColor  = reco === 'INVESTIR' ? '#27ae60'\n                 : reco === 'INVESTIR SOUS CONDITIONS' ? '#e67e22'\n                 : '#c0392b';\n\nconst recoIcon   = reco === 'INVESTIR' ? '✅'\n                 : reco === 'INVESTIR SOUS CONDITIONS' ? '⚠️'\n                 : '❌';\n\n// Lignes du tableau des critères\nconst rows = criteres.map(c => {\n  const sc = c.score || 0;\n  const pct = sc >= 7 ? '#27ae60' : sc >= 5 ? '#e67e22' : '#c0392b';\n  const noCtx = c.no_context ? ' <span style=\"color:#e74c3c\">[⚠ hors corpus]</span>' : '';\n  return `\n    <tr>\n      <td><b>${c.label}</b></td>\n      <td style=\"text-align:center\">${c.poids_pct}</td>\n      <td style=\"text-align:center;color:${pct};font-weight:bold\">${sc}/10</td>\n      <td style=\"text-align:center\">${c.score_pondere}</td>\n      <td style=\"font-size:12px\">${(c.sources || []).join(', ') || 'N/A'}${noCtx}</td>\n    </tr>`;\n}).join('');\n\n// Extraire la justification de chaque critère (ligne \"Justification:\")\nconst details = criteres.map(c => {\n  const just = (c.reponse || '').split('\\n')\n    .find(l => l.toLowerCase().startsWith('justification'));\n  return `<li><b>${c.label} (${c.poids_pct})</b> — ${just || c.reponse || 'N/A'}</li>`;\n}).join('');\n\nconst html = `<!DOCTYPE html>\n<html lang=\"fr\">\n<head>\n  <meta charset=\"UTF-8\">\n  <title>Rapport FallahTech — Scoring T3</title>\n  <style>\n    body  { font-family: Arial, sans-serif; max-width: 860px; margin: 40px auto;\n            color: #2c3e50; background: #f9f9f9; }\n    h1    { background: #1a1a2e; color: white; padding: 20px; border-radius: 6px;\n            margin-bottom: 6px; }\n    h2    { color: #c0392b; border-bottom: 2px solid #c0392b; padding-bottom: 4px; }\n    table { width: 100%; border-collapse: collapse; margin: 16px 0; }\n    th    { background: #1a1a2e; color: white; padding: 10px 8px; text-align: left; }\n    td    { padding: 9px 8px; border-bottom: 1px solid #ddd; vertical-align: top; }\n    tr:nth-child(even) td { background: #f0f4f8; }\n    .reco { font-size: 22px; font-weight: bold; padding: 16px 24px;\n            border-radius: 8px; display: inline-block; margin: 10px 0;\n            background: #fff; border: 3px solid ${recoColor}; color: ${recoColor}; }\n    .score-big { font-size: 48px; font-weight: bold; color: ${recoColor}; }\n    .box  { background: white; border-radius: 8px; padding: 20px 24px;\n            box-shadow: 0 2px 8px rgba(0,0,0,.08); margin: 20px 0; }\n    ul    { margin: 0; padding-left: 20px; }\n    li    { margin-bottom: 8px; font-size: 14px; }\n    .footer { font-size: 12px; color: #888; margin-top: 30px; text-align: center; }\n  </style>\n</head>\n<body>\n  <h1>📊 Rapport de Scoring — FallahTech SARL</h1>\n  <p style=\"color:#888;margin-top:4px\">Généré le ${date} via n8n · Tâche T3 — Scoring Automatique</p>\n\n  <div class=\"box\" style=\"text-align:center\">\n    <div>Score final pondéré</div>\n    <div class=\"score-big\">${score} <span style=\"font-size:24px\">/10</span></div>\n    <div class=\"reco\">${recoIcon} ${reco}</div>\n  </div>\n\n  <div class=\"box\">\n    <h2>Détail par critère</h2>\n    <table>\n      <tr><th>Critère</th><th>Poids</th><th>Score</th><th>Pondéré</th><th>Sources</th></tr>\n      ${rows}\n    </table>\n  </div>\n\n  <div class=\"box\">\n    <h2>Justifications</h2>\n    <ul>${details}</ul>\n  </div>\n\n  <p class=\"footer\">FallahTech SARL — Dossier Série A · Workflow n8n · ENISo 2025</p>\n</body>\n</html>`;\n\nreturn [{ json: { html, score, recommandation: reco, date, recoColor } }];"
+      },
+      "notes": "Construit un rapport HTML propre à partir des données JSON renvoyées par /scoring. Le rapport inclut : score final, tableau par critère avec poids/score/sources, et les justifications LLM."
+    },
+
+    {
+      "id": "n8",
+      "name": "Envoyer par Email (Gmail)",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [1420, 180],
+      "parameters": {
+        "sendTo": "={{ $vars.ANALYST_EMAIL }}",
+        "subject": "=📊 FallahTech Scoring T3 — {{ $('Lancer le Scoring T3 complet').item.json.score_total }}/10 — {{ $('Lancer le Scoring T3 complet').item.json.recommandation }}",
+        "emailType": "html",
+        "message": "={{ $json.html }}",
+        "options": {}
+      },
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "REMPLACE_PAR_TON_ID_CREDENTIAL",
+          "name": "Gmail FallahTech"
+        }
+      },
+      "notes": "Envoie le rapport HTML par email. Configure la variable ANALYST_EMAIL dans n8n : Settings > Variables. Credential Gmail à connecter via OAuth2 dans n8n Credentials."
+    },
+
+    {
+      "id": "n9",
+      "name": "Sauvegarder HTML en local",
+      "type": "n8n-nodes-base.writeBinaryFile",
+      "typeVersion": 1,
+      "position": [1420, 420],
+      "parameters": {
+        "fileName": "=outputs/rapport_n8n_{{ $now.format('yyyyMMdd_HHmm') }}.html",
+        "dataPropertyName": "htmlFile"
+      },
+      "notes": "Sauvegarde le rapport HTML dans le dossier outputs/ de ton projet RAG. Le chemin est relatif à l'endroit où n8n est lancé — assure-toi de lancer n8n depuis la racine du projet RAG."
+    },
+
+    {
+      "id": "n10",
+      "name": "Préparer fichier binaire HTML",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1420, 300],
+      "parameters": {
+        "jsCode": "// Convertit le HTML string en binaire pour le nœud WriteBinaryFile\nconst html = $input.item.json.html;\nconst buffer = Buffer.from(html, 'utf-8');\n\nreturn [{\n  json: $input.item.json,\n  binary: {\n    htmlFile: {\n      data: buffer.toString('base64'),\n      mimeType: 'text/html',\n      fileName: `rapport_n8n_${Date.now()}.html`\n    }\n  }\n}];"
+      },
+      "notes": "n8n nécessite un objet binaire pour écrire un fichier. Ce nœud encode le HTML en base64 pour le passer au nœud WriteBinaryFile."
+    },
+
+    {
+      "id": "n11",
+      "name": "Résumé final",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1640, 300],
+      "parameters": {
+        "jsCode": "const scoring = $('Lancer le Scoring T3 complet').item.json;\nconst chroma  = $('Vérifier ChromaDB indexé').item.json;\n\nconsole.log('═'.repeat(50));\nconsole.log('  WORKFLOW TERMINÉ — FallahTech Scoring T3');\nconsole.log('  Score total    : ' + scoring.score_total + '/10');\nconsole.log('  Recommandation : ' + scoring.recommandation);\nconsole.log('  Chunks utilisés: ' + chroma.chunks_indexed);\nconsole.log('═'.repeat(50));\n\nreturn [{\n  json: {\n    status: 'success',\n    score_total:    scoring.score_total,\n    recommandation: scoring.recommandation,\n    chunks_indexed: chroma.chunks_indexed,\n    criteres_count: (scoring.criteres || []).length,\n    completed_at:   new Date().toISOString()\n  }\n}];"
+      },
+      "notes": "Affiche un résumé dans les logs n8n et retourne un objet de statut. Utile pour suivre les exécutions dans l'historique n8n."
+    }
+
+  ],
+
+  "connections": {
+    "Déclencheur Manuel": {
+      "main": [[ { "node": "Vérifier que le serveur RAG tourne", "type": "main", "index": 0 } ]]
+    },
+    "Vérifier que le serveur RAG tourne": {
+      "main": [[ { "node": "Vérifier ChromaDB indexé", "type": "main", "index": 0 } ]]
+    },
+    "Vérifier ChromaDB indexé": {
+      "main": [[ { "node": "ChromaDB est-il prêt ?", "type": "main", "index": 0 } ]]
+    },
+    "ChromaDB est-il prêt ?": {
+      "main": [
+        [ { "node": "Lancer le Scoring T3 complet", "type": "main", "index": 0 } ],
+        [ { "node": "Arrêt — ChromaDB non indexé",  "type": "main", "index": 0 } ]
+      ]
+    },
+    "Lancer le Scoring T3 complet": {
+      "main": [[ { "node": "Construire le Rapport HTML", "type": "main", "index": 0 } ]]
+    },
+    "Construire le Rapport HTML": {
+      "main": [[ { "node": "Préparer fichier binaire HTML", "type": "main", "index": 0 } ]]
+    },
+    "Préparer fichier binaire HTML": {
+      "main": [[
+        { "node": "Envoyer par Email (Gmail)",    "type": "main", "index": 0 },
+        { "node": "Sauvegarder HTML en local",    "type": "main", "index": 0 },
+        { "node": "Résumé final",                  "type": "main", "index": 0 }
+      ]]
+    }
+  },
+
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true
+  },
+  "tags": [
+    { "name": "FallahTech" },
+    { "name": "RAG" },
+    { "name": "T3-Scoring" }
+  ]
+}
