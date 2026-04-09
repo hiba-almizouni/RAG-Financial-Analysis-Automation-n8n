@@ -246,10 +246,7 @@ Marché       15%     7/10    1.05
 ## 🎓 Academic Context
 
 - **School** : École Nationale d'Ingénieurs de Sousse (ENISo)
-- **Course** : Technologie de Pointe
-- **Professor** : Takoua Abdellatif
-- **Task** : T3 — Automatic Investment Scoring
-- **Team** : 4 students — 2 on RAG (Part A) · 2 on n8n Automation (Part B)
+
 
 ---
 
